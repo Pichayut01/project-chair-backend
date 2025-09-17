@@ -10,13 +10,54 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const admin = require('firebase-admin');
+// const User = require('./models/User'); // Commented out to use inline schema
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const { Server } = require('socket.io');
+const http = require('http');
 
-// 3. สร้าง Express App
+// Login History Schema
+const loginHistorySchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    action: { type: String, required: true }, // 'login', 'logout', 'password_changed', '2fa_enabled', etc.
+    ipAddress: { type: String },
+    userAgent: { type: String },
+    location: { type: String },
+    timestamp: { type: Date, default: Date.now }
+});
+
+const LoginHistory = mongoose.model('LoginHistory', loginHistorySchema);
+
+// Active Session Schema
+const activeSessionSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    sessionToken: { type: String, required: true },
+    ipAddress: { type: String },
+    userAgent: { type: String },
+    location: { type: String },
+    createdAt: { type: Date, default: Date.now },
+    lastActivity: { type: Date, default: Date.now },
+    isActive: { type: Boolean, default: true }
+});
+
+const ActiveSession = mongoose.model('ActiveSession', activeSessionSchema);
+
+// 3. สร้าง Express App และ HTTP Server
 const app = express();
+const server = http.createServer(app);
 const port = process.env.PORT || 5000;
+
+// 3.1 Initialize Socket.IO
+const io = new Server(server, {
+    cors: {
+        origin: ["http://localhost:3001", "http://localhost:3000"],
+        methods: ["GET", "POST"],
+        credentials: true
+    }
+});
 
 // 4. Firebase Admin SDK Initialization
 const serviceAccount = require('./chair-f440c-firebase-adminsdk-fbsvc-92d591e38e.json');
@@ -29,6 +70,27 @@ console.log('Firebase Admin SDK initialized.');
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// 5.1. Email Configuration
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    },
+    tls: {
+        rejectUnauthorized: false
+    }
+});
+
+// Test email configuration on startup
+transporter.verify(function(error, success) {
+    if (error) {
+        console.log('Email configuration error:', error);
+    } else {
+        console.log('Email server is ready to send messages');
+    }
+});
 
 // 6. เชื่อมต่อ MongoDB Database
 const uri = process.env.MONGODB_URI;
@@ -63,6 +125,13 @@ const userSchema = new mongoose.Schema({
     createdClasses: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Class' }],
     enrolledClasses: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Class' }],
     pinnedClasses: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Class' }], // เพิ่มโค้ดนี้
+    resetPasswordToken: { type: String, select: false },
+    resetPasswordExpires: { type: Date, select: false },
+    twoFactorEnabled: { type: Boolean, default: false },
+    twoFactorCode: { type: String, select: false },
+    twoFactorExpires: { type: Date, select: false },
+    loginOtpCode: { type: String, select: false },
+    loginOtpExpires: { type: Date, select: false }
 });
 const User = mongoose.model('User', userSchema);
 
@@ -85,12 +154,85 @@ const classSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.Mixed, // หรือจะใช้ Map ก็ได้
         default: {}
     },
+    studentScores: {
+        type: mongoose.Schema.Types.Mixed,
+        default: {}
+    },
     rows: { type: Number, default: 0 },
     cols: { type: Number, default: 0 },
 });
 const Class = mongoose.model('Class', classSchema);
 
+// Socket.IO Connection Handling
+io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
 
+    // Join classroom room
+    socket.on('join-classroom', (data) => {
+        const { classId, userId, userName } = data;
+        socket.join(classId);
+        console.log(`User ${userName} (${userId}) joined classroom ${classId}`);
+    });
+
+    // Handle score updates
+    socket.on('update-score', (data) => {
+        console.log('Score update received:', data);
+        const { classId, studentId, newScore, presetName, studentName, updatedBy, timestamp } = data;
+        
+        // Emit to all users in the classroom
+        socket.to(classId).emit('score-updated', {
+            studentId,
+            newScore,
+            presetName,
+            studentName,
+            updatedBy,
+            timestamp
+        });
+    });
+
+    // Handle broadcast score updates
+    socket.on('broadcast-score-update', (data) => {
+        console.log('Broadcasting score update:', data);
+        const { classId } = data;
+        
+        // Broadcast to all users in the classroom including sender
+        io.to(classId).emit('broadcast-score-update', data);
+    });
+
+    // Handle chair seating updates
+    socket.on('chair-seating-update', (data) => {
+        console.log('Chair seating update received:', data);
+        const { classId, chairId, assignedUsers, action, userName, updatedBy, timestamp } = data;
+        
+        // Emit to all users in the classroom except sender
+        socket.to(classId).emit('chair-seating-updated', {
+            chairId,
+            assignedUsers,
+            action,
+            userName,
+            updatedBy,
+            timestamp
+        });
+    });
+
+    // Handle chair movement updates
+    socket.on('chair-movement-update', (data) => {
+        console.log('Chair movement update received:', data);
+        const { classId, chairPositions, movedChairId, updatedBy, timestamp } = data;
+        
+        // Emit to all users in the classroom except sender
+        socket.to(classId).emit('chair-moved', {
+            chairPositions,
+            movedChairId,
+            updatedBy,
+            timestamp
+        });
+    });
+
+    socket.on('disconnect', () => {
+        console.log('User disconnected:', socket.id);
+    });
+});
 
 // 9. Middleware สำหรับตรวจสอบสิทธิ์
 const authMiddleware = async (req, res, next) => {
@@ -341,10 +483,10 @@ app.post('/api/auth/register', async (req, res) => {
 
 // ** Manual Login User **
 app.post('/api/auth/login', async (req, res) => {
-    const { email, password } = req.body;
+    const { email, password, otpCode } = req.body;
 
     try {
-        let user = await User.findOne({ email }).select('+password');
+        let user = await User.findOne({ email }).select('+password +twoFactorEnabled +loginOtpCode +loginOtpExpires');
         if (!user) {
             return res.status(400).json({ msg: 'Invalid Credentials.' });
         }
@@ -354,13 +496,84 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(400).json({ msg: 'Invalid Credentials.' });
         }
 
+        // Check if 2FA is enabled
+        if (user.twoFactorEnabled) {
+            // If OTP code is not provided, send OTP and require verification
+            if (!otpCode) {
+                // Generate 6-digit OTP
+                const otp = Math.floor(100000 + Math.random() * 900000).toString();
+                const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+                // Save OTP to user
+                await User.findByIdAndUpdate(user._id, {
+                    loginOtpCode: otp,
+                    loginOtpExpires: otpExpires
+                });
+
+                // Send OTP email
+                const mailOptions = {
+                    from: process.env.EMAIL_USER,
+                    to: user.email,
+                    subject: 'Chair App - Login Verification Code',
+                    html: `
+                        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                            <h2 style="color: #1a73e8;">Login Verification Required</h2>
+                            <p>Your login verification code is:</p>
+                            <div style="background: #f8f9fa; padding: 20px; text-align: center; margin: 20px 0; border-radius: 8px;">
+                                <h1 style="color: #1a73e8; font-size: 32px; margin: 0; letter-spacing: 5px;">${otp}</h1>
+                            </div>
+                            <p>This code will expire in 10 minutes.</p>
+                            <p>If you didn't request this login, please ignore this email.</p>
+                        </div>
+                    `
+                };
+
+                await transporter.sendMail(mailOptions);
+
+                return res.json({ 
+                    requiresOtp: true, 
+                    message: 'OTP sent to your email. Please verify to complete login.',
+                    tempUserId: user._id
+                });
+            }
+
+            // If OTP code is provided, verify it
+            if (otpCode) {
+                if (!user.loginOtpCode || !user.loginOtpExpires) {
+                    return res.status(400).json({ msg: 'No OTP found. Please request a new one.' });
+                }
+
+                if (new Date() > user.loginOtpExpires) {
+                    return res.status(400).json({ msg: 'OTP has expired. Please request a new one.' });
+                }
+
+                if (otpCode !== user.loginOtpCode) {
+                    return res.status(400).json({ msg: 'Invalid OTP code.' });
+                }
+
+                // Clear OTP after successful verification
+                await User.findByIdAndUpdate(user._id, {
+                    $unset: { loginOtpCode: 1, loginOtpExpires: 1 }
+                });
+            }
+        }
+
+        // Log successful login
+        await LoginHistory.create({
+            userId: user._id,
+            action: 'login',
+            ipAddress: req.ip || req.connection.remoteAddress,
+            userAgent: req.get('User-Agent')
+        });
+
         const payload = {
             user: {
                 id: user.id,
                 email: user.email,
                 displayName: user.displayName,
                 photoURL: user.photoURL,
-                uid: user.uid
+                uid: user.uid,
+                twoFactorEnabled: user.twoFactorEnabled
             },
         };
 
@@ -379,6 +592,417 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+// ** Forgot Password Endpoint **
+app.post('/api/auth/forgot-password', async (req, res) => {
+    console.log('Forgot password request received:', req.body);
+    const { email } = req.body;
+
+    // Input validation
+    if (!email) {
+        console.log('Missing email field');
+        return res.status(400).json({ msg: 'Email is required.' });
+    }
+
+    try {
+        const normalizedEmail = email.toLowerCase().trim();
+        console.log('Looking for user with email:', normalizedEmail);
+        
+        const user = await User.findOne({ email: normalizedEmail }).select('+resetPasswordToken +resetPasswordExpires');
+        
+        if (!user) {
+            console.log('User not found with email:', normalizedEmail);
+            // Don't reveal if user exists or not for security
+            return res.json({ msg: 'If an account with that email exists, we have sent a password reset link.' });
+        }
+
+        console.log('User found, generating reset token...');
+        
+        // Generate reset token
+        const resetToken = crypto.randomBytes(32).toString('hex');
+        const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+        
+        // Set token and expiration (1 hour)
+        user.resetPasswordToken = resetTokenHash;
+        user.resetPasswordExpires = Date.now() + 60 * 60 * 1000; // 1 hour
+        await user.save();
+
+        console.log('Reset token saved, sending email...');
+
+        // Create reset URL
+        const resetURL = `${process.env.CLIENT_URL || 'http://localhost:3000'}/reset-password/${resetToken}`;
+
+        // Email options
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: user.email,
+            subject: 'Password Reset Request - Chair App',
+            html: `
+                <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                    <h2 style="color: #4CAF50;">Password Reset Request</h2>
+                    <p>Hello ${user.displayName || 'User'},</p>
+                    <p>You have requested to reset your password for your Chair App account.</p>
+                    <p>Please click the button below to reset your password:</p>
+                    <div style="text-align: center; margin: 30px 0;">
+                        <a href="${resetURL}" 
+                           style="background-color: #4CAF50; color: white; padding: 12px 30px; 
+                                  text-decoration: none; border-radius: 5px; display: inline-block;">
+                            Reset Password
+                        </a>
+                    </div>
+                    <p>Or copy and paste this link in your browser:</p>
+                    <p style="word-break: break-all; color: #666;">${resetURL}</p>
+                    <p><strong>This link will expire in 1 hour.</strong></p>
+                    <p>If you did not request this password reset, please ignore this email.</p>
+                    <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+                    <p style="color: #666; font-size: 12px;">Chair App Team</p>
+                </div>
+            `
+        };
+
+        // Send email
+        try {
+            await transporter.sendMail(mailOptions);
+            console.log('Password reset email sent successfully to:', user.email);
+        } catch (emailError) {
+            console.error('Email sending error:', emailError);
+            throw new Error(`Email sending failed: ${emailError.message}`);
+        }
+
+        res.json({ msg: 'If an account with that email exists, we have sent a password reset link.' });
+    } catch (err) {
+        console.error('Forgot password error:', err);
+        
+        // More specific error messages for debugging
+        if (err.message.includes('Email sending failed')) {
+            res.status(500).json({ 
+                msg: 'Failed to send reset email. Please check email configuration.', 
+                error: err.message 
+            });
+        } else {
+            res.status(500).json({ 
+                msg: 'Server error during password reset request', 
+                error: err.message 
+            });
+        }
+    }
+});
+
+// ** Reset Password Endpoint **
+app.post('/api/auth/reset-password/:token', async (req, res) => {
+    console.log('Reset password request received');
+    const { token } = req.params;
+    const { password } = req.body;
+
+    // Input validation
+    if (!password) {
+        console.log('Missing password field');
+        return res.status(400).json({ msg: 'Password is required.' });
+    }
+
+    // Enhanced password validation
+    if (password.length < 8) {
+        console.log('Password too short');
+        return res.status(400).json({ msg: 'Password must be at least 8 characters long.' });
+    }
+
+    // Check password strength requirements
+    const hasUppercase = /[A-Z]/.test(password);
+    const hasLowercase = /[a-z]/.test(password);
+    const hasNumber = /\d/.test(password);
+    const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
+    
+    const strengthScore = [hasUppercase, hasLowercase, hasNumber, hasSpecial].filter(Boolean).length;
+    
+    if (strengthScore < 3) {
+        console.log('Password too weak, score:', strengthScore);
+        return res.status(400).json({ 
+            msg: 'Password must contain at least 3 of the following: uppercase letter, lowercase letter, number, special character.' 
+        });
+    }
+
+    try {
+        console.log('Hashing reset token for lookup...');
+        
+        // Hash the token to compare with stored hash
+        const resetTokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        
+        // Find user with valid reset token
+        const user = await User.findOne({
+            resetPasswordToken: resetTokenHash,
+            resetPasswordExpires: { $gt: Date.now() }
+        }).select('+password +resetPasswordToken +resetPasswordExpires');
+
+        if (!user) {
+            console.log('Invalid or expired reset token');
+            return res.status(400).json({ msg: 'Password reset token is invalid or has expired.' });
+        }
+
+        console.log('Valid reset token found, updating password...');
+
+        // Hash new password
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+
+        // Update password and clear reset token fields
+        user.password = hashedPassword;
+        user.resetPasswordToken = undefined;
+        user.resetPasswordExpires = undefined;
+        await user.save();
+
+        console.log('Password updated successfully');
+
+        res.json({ msg: 'Password has been reset successfully. You can now login with your new password.' });
+    } catch (err) {
+        console.error('Reset password error:', err);
+        res.status(500).json({ msg: 'Server error during password reset', error: err.message });
+    }
+});
+
+
+// Change password endpoint
+app.put('/api/auth/change-password', authMiddleware, async (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body;
+        const userId = req.user.id;
+
+        if (!currentPassword || !newPassword) {
+            return res.status(400).json({ msg: 'Current password and new password are required' });
+        }
+
+        if (newPassword.length < 6) {
+            return res.status(400).json({ msg: 'New password must be at least 6 characters long' });
+        }
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ msg: 'User not found' });
+        }
+
+        // Verify current password
+        const isMatch = await bcrypt.compare(currentPassword, user.password);
+        if (!isMatch) {
+            return res.status(400).json({ msg: 'Current password is incorrect' });
+        }
+
+        // Hash new password
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+        // Update password
+        await User.findByIdAndUpdate(userId, { password: hashedPassword });
+
+        // Log the password change
+        await LoginHistory.create({
+            userId: userId,
+            action: 'password_changed',
+            ipAddress: req.ip || req.connection.remoteAddress,
+            userAgent: req.get('User-Agent'),
+            timestamp: new Date()
+        });
+
+        res.json({ msg: 'Password changed successfully' });
+
+    } catch (error) {
+        console.error('Change password error:', error);
+        res.status(500).json({ msg: 'Server error while changing password' });
+    }
+});
+
+// Enable/Disable Two-Factor Authentication
+app.post('/api/auth/2fa/toggle', authMiddleware, async (req, res) => {
+    try {
+        const { enable } = req.body;
+        const userId = req.user.id;
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ msg: 'User not found' });
+        }
+
+        if (enable) {
+            // Generate and send 2FA code via email
+            const code = Math.floor(100000 + Math.random() * 900000).toString();
+            const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+            await User.findByIdAndUpdate(userId, {
+                twoFactorEnabled: true,
+                twoFactorCode: code,
+                twoFactorExpires: expiresAt
+            });
+
+            // Send email with 2FA code
+            const mailOptions = {
+                from: process.env.EMAIL_USER,
+                to: user.email,
+                subject: 'Two-Factor Authentication Setup - Chair App',
+                html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                        <h2 style="color: #4CAF50;">Two-Factor Authentication Setup</h2>
+                        <p>Hello ${user.displayName},</p>
+                        <p>You have enabled Two-Factor Authentication for your Chair App account.</p>
+                        <div style="background-color: #f5f5f5; padding: 20px; border-radius: 5px; text-align: center; margin: 20px 0;">
+                            <h3 style="margin: 0; color: #333;">Your verification code:</h3>
+                            <h1 style="color: #4CAF50; font-size: 32px; margin: 10px 0; letter-spacing: 5px;">${code}</h1>
+                            <p style="color: #666; margin: 0;">This code will expire in 10 minutes</p>
+                        </div>
+                        <p>If you didn't request this, please contact support immediately.</p>
+                        <p>Best regards,<br>Chair App Team</p>
+                    </div>
+                `
+            };
+
+            await transporter.sendMail(mailOptions);
+            res.json({ msg: 'Two-Factor Authentication enabled. Check your email for verification code.' });
+
+        } else {
+            await User.findByIdAndUpdate(userId, {
+                twoFactorEnabled: false,
+                twoFactorCode: null,
+                twoFactorExpires: null
+            });
+            res.json({ msg: 'Two-Factor Authentication disabled successfully' });
+        }
+
+    } catch (error) {
+        console.error('2FA toggle error:', error);
+        res.status(500).json({ msg: 'Server error while updating 2FA settings' });
+    }
+});
+
+// Verify 2FA code
+app.post('/api/auth/2fa/verify', authMiddleware, async (req, res) => {
+    try {
+        const { code } = req.body;
+        const userId = req.user.id;
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ msg: 'User not found' });
+        }
+
+        if (!user.twoFactorCode || user.twoFactorExpires < new Date()) {
+            return res.status(400).json({ msg: 'Verification code has expired' });
+        }
+
+        if (user.twoFactorCode !== code) {
+            return res.status(400).json({ msg: 'Invalid verification code' });
+        }
+
+        // Clear the verification code
+        await User.findByIdAndUpdate(userId, {
+            twoFactorCode: null,
+            twoFactorExpires: null
+        });
+
+        res.json({ msg: 'Two-Factor Authentication verified successfully' });
+
+    } catch (error) {
+        console.error('2FA verify error:', error);
+        res.status(500).json({ msg: 'Server error while verifying 2FA code' });
+    }
+});
+
+// Get login history
+app.get('/api/auth/login-history', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+
+        const history = await LoginHistory.find({ userId })
+            .sort({ timestamp: -1 })
+            .skip(skip)
+            .limit(limit);
+
+        const total = await LoginHistory.countDocuments({ userId });
+
+        res.json({
+            history,
+            pagination: {
+                current: page,
+                total: Math.ceil(total / limit),
+                hasNext: skip + limit < total,
+                hasPrev: page > 1
+            }
+        });
+
+    } catch (error) {
+        console.error('Login history error:', error);
+        res.status(500).json({ msg: 'Server error while fetching login history' });
+    }
+});
+
+// Get active sessions
+app.get('/api/auth/active-sessions', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+
+        const sessions = await ActiveSession.find({ userId })
+            .sort({ lastActivity: -1 });
+
+        res.json({ sessions });
+
+    } catch (error) {
+        console.error('Active sessions error:', error);
+        res.status(500).json({ msg: 'Server error while fetching active sessions' });
+    }
+});
+
+// Terminate session
+app.delete('/api/auth/sessions/:sessionId', authMiddleware, async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const userId = req.user.id;
+
+        const session = await ActiveSession.findOne({ _id: sessionId, userId });
+        if (!session) {
+            return res.status(404).json({ msg: 'Session not found' });
+        }
+
+        await ActiveSession.findByIdAndDelete(sessionId);
+        res.json({ msg: 'Session terminated successfully' });
+
+    } catch (error) {
+        console.error('Terminate session error:', error);
+        res.status(500).json({ msg: 'Server error while terminating session' });
+    }
+});
+
+// Update user profile information
+app.put('/api/auth/profile/update', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const updateData = req.body;
+
+        // Remove sensitive fields that shouldn't be updated via this endpoint
+        delete updateData.email;
+        delete updateData.password;
+        delete updateData._id;
+        delete updateData.uid;
+
+        console.log('Updating user profile:', userId, updateData);
+
+        const updatedUser = await User.findByIdAndUpdate(
+            userId,
+            { $set: updateData },
+            { new: true, runValidators: true }
+        ).select('-password');
+
+        if (!updatedUser) {
+            return res.status(404).json({ msg: 'User not found' });
+        }
+
+        res.json({
+            msg: 'Profile updated successfully',
+            user: updatedUser
+        });
+
+    } catch (error) {
+        console.error('Profile update error:', error);
+        res.status(500).json({ msg: 'Server error while updating profile' });
+    }
+});
 
 app.post('/api/auth/profile/update-photo', authMiddleware, (req, res) => {
     upload(req, res, async (err) => {
@@ -572,6 +1196,7 @@ app.get('/api/classrooms/:id', authMiddleware, async (req, res) => {
         }
 
         // ถ้าเป็นสมาชิกแล้ว ให้ return ข้อมูลปกติ
+        console.log('Returning classroom with scores:', classroom.studentScores);
         res.json(classroom);
     } catch (err) {
         console.error(err.message);
@@ -687,16 +1312,30 @@ app.post('/api/classrooms/join', authMiddleware, async (req, res) => {
 
 app.put('/api/classrooms/:classId/seating', authMiddleware, async (req, res) => {
     const { classId } = req.params;
-    const { seatingPositions, assignedUsers } = req.body;
+    const { seatingPositions, assignedUsers, studentScores } = req.body;
     try {
+        console.log('Seating update request:', { seatingPositions, assignedUsers, studentScores });
+        
         const updateObj = {};
         if (seatingPositions) updateObj.seatingPositions = seatingPositions;
         if (assignedUsers) updateObj.assignedUsers = assignedUsers;
+        if (studentScores) updateObj.studentScores = studentScores;
+        
+        console.log('Update object:', updateObj);
+        
         const classroom = await Class.findByIdAndUpdate(classId, updateObj, { new: true });
         if (!classroom) {
             return res.status(404).json({ msg: 'Classroom not found' });
         }
-        res.json({ msg: 'Seating positions updated', seatingPositions: classroom.seatingPositions, assignedUsers: classroom.assignedUsers });
+        
+        console.log('Updated classroom scores:', classroom.studentScores);
+        
+        res.json({ 
+            msg: 'Seating positions updated', 
+            seatingPositions: classroom.seatingPositions, 
+            assignedUsers: classroom.assignedUsers,
+            studentScores: classroom.studentScores
+        });
     } catch (err) {
         console.error('Error updating seating positions:', err);
         res.status(500).send('Server error');
@@ -1079,6 +1718,7 @@ app.post('/api/debug/test-register', async (req, res) => {
 });
 
 // 11. Start Server
-app.listen(port, () => {
+server.listen(port, () => {
     console.log(`Server is running on port: ${port}`);
+    console.log(`Socket.IO server is ready`);
 });
